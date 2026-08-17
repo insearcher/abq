@@ -33,11 +33,15 @@ Nothing is scraped off a terminal.
 
 ## Install
 
-Python 3.10+, no runtime dependencies.
+Python 3.10+, no runtime dependencies. macOS and Linux — Claude Code's
+cross-session messaging does not exist on native Windows.
 
 ```bash
-uv tool install abq
+uv tool install git+https://github.com/insearcher/abq
 ```
+
+Not on PyPI: that name belongs to an unrelated project, so installing `abq`
+from PyPI would fetch something else entirely.
 
 ## Use
 
