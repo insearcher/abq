@@ -94,6 +94,12 @@ A plain `codex` runs its agent in-process and cannot be joined afterwards — th
 is Codex's design, not a limitation abq can route around. Point abq at a
 different endpoint with `ABQ_CODEX_ENDPOINT`.
 
+You can still watch a bridged session in the Codex desktop app: threads live in
+`~/.codex`, shared by every app-server on the machine, so a thread started with
+`codex --remote` shows up in the desktop app's thread list. Watch it there, but
+send from the terminal session — see the caveat in
+[COMPATIBILITY.md](COMPATIBILITY.md#watching-a-bridged-thread-in-the-desktop-app).
+
 ## State
 
 Everything lives in `~/.abq` (override with `ABQ_HOME`):

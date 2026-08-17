@@ -76,6 +76,25 @@ into. Inside a session, `$CODEX_THREAD_ID` names its own thread, which is what
 - A plain `codex` TUI runs its agent in-process and is invisible to every
   app-server, so it cannot be joined retroactively. Sessions must start as
   `codex --remote <endpoint>`.
+- Threads are per-machine state, not per-process: `thread/list` reads the shared
+  store under `~/.codex`, while `thread/loaded/list` is only what *this*
+  app-server holds in memory. abq checks the loaded set before delivering,
+  because a thread can be listed everywhere yet injectable nowhere.
+
+### Watching a bridged thread in the desktop app
+
+A thread started with `codex --remote` appears in the Codex desktop app's thread
+list, since both read the same store — verified by both app-servers holding the
+same rollout file open. That makes the desktop app a comfortable way to watch
+two agents talk while abq drives them from the terminal.
+
+Watch, but don't drive it from there. Typing into that thread in the desktop app
+puts a second app-server on the same conversation, and which one owns the turn is
+not defined by anything documented. Send through the session abq knows about.
+
+abq cannot deliver into a thread the desktop app started on its own: that
+app-server runs on stdio with no listening socket, and `~/.codex/ipc/ipc.sock`
+speaks a different protocol (it refuses the WebSocket upgrade).
 
 **Verification schema.** The authoritative shapes come from the CLI itself:
 
