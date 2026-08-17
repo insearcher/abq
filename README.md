@@ -44,6 +44,20 @@ uv tool install git+https://github.com/insearcher/abq
 Not on PyPI: that name belongs to an unrelated project, so installing `abq`
 from PyPI would fetch something else entirely.
 
+To give Codex or Claude Code the agent-facing transport workflow, install the
+separate plugin after the CLI. Both hosts use the same `insearcher` catalog and
+plugin identity, `abq@insearcher`; the catalog is maintained at
+[`insearcher/plugin-marketplace`](https://github.com/insearcher/plugin-marketplace).
+The plugin does not install or update the CLI and does not add workflow policy.
+
+```bash
+codex plugin marketplace add insearcher/plugin-marketplace
+codex plugin add abq@insearcher
+```
+
+In Claude Code, add `insearcher/plugin-marketplace` with
+`/plugin marketplace add`, then install `abq@insearcher`.
+
 ## Use
 
 Register each session once, from inside it:

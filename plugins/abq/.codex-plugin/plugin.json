@@ -1,0 +1,38 @@
+{
+  "name": "abq",
+  "version": "0.1.0",
+  "description": "Agent-facing workflows for the ABQ local transport between Claude Code and Codex.",
+  "author": {
+    "name": "insearcher",
+    "url": "https://github.com/insearcher"
+  },
+  "homepage": "https://github.com/insearcher/abq",
+  "repository": "https://github.com/insearcher/abq",
+  "license": "MIT",
+  "keywords": [
+    "abq",
+    "agent-transport",
+    "claude-code",
+    "codex",
+    "local-messaging"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ABQ",
+    "shortDescription": "Connect local Claude Code and Codex agents.",
+    "longDescription": "Use ABQ as a local transport for exact agent addresses, attached-session messages, resumable one-shot replies, and raw provider lifecycle operations. Calling skills retain workflow and policy decisions.",
+    "developerName": "insearcher",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/insearcher/abq",
+    "defaultPrompt": [
+      "Show which local agents are reachable through ABQ.",
+      "Send this request to an exact ABQ address and wait for the reply.",
+      "Use ABQ for a raw provider run with policy I supply."
+    ]
+  }
+}

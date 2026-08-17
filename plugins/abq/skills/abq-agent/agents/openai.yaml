@@ -1,0 +1,4 @@
+interface:
+  display_name: "ABQ Agent Transport"
+  short_description: "Route messages and results between local agents"
+  default_prompt: "Use $abq-agent to send a request to another local agent and wait for its reply."
