@@ -10,11 +10,12 @@ import shutil
 import socket
 import tempfile
 import threading
+import queue
 
 import pytest
 
 from abq.adapters.base import Held, Unreachable
-from abq.adapters.claude import ClaudeAdapter
+from abq.adapters.claude import ClaudeAdapter, ClaudeTurnError, ManagedClaude
 from abq.registry import Agent
 
 
@@ -181,3 +182,122 @@ def test_detect_self_outside_a_session(monkeypatch):
     monkeypatch.setattr("abq.adapters.claude._owning_pid", lambda: None)
 
     assert ClaudeAdapter().detect_self() is None
+
+
+class _FakeOutput:
+    def __init__(self):
+        self.lines = queue.Queue()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.lines.get(timeout=2)
+        if line is None:
+            raise StopIteration
+        return line
+
+
+class _FakeInput:
+    def __init__(self, process):
+        self.process = process
+
+    def write(self, line):
+        frame = json.loads(line)
+        text = frame["message"]["content"][0]["text"]
+        self.process.stdout.lines.put(json.dumps({"type": "assistant", "text": text}) + "\n")
+        self.process.stdout.lines.put(
+            json.dumps(
+                {
+                    "type": "result",
+                    "session_id": "same-session",
+                    "result": f"reply:{text}",
+                    "is_error": False,
+                }
+            )
+            + "\n"
+        )
+        return len(line)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.process.returncode = 0
+        self.process.stdout.lines.put(None)
+
+
+class _FakeProcess:
+    def __init__(self, command):
+        self.command = command
+        self.pid = 4242
+        self.returncode = None
+        self.stdout = _FakeOutput()
+        self.stderr = []
+        self.stdin = _FakeInput(self)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
+def test_managed_claude_keeps_one_stream_for_multiple_turns(monkeypatch):
+    created = []
+
+    def fake_popen(command, **kwargs):
+        process = _FakeProcess(command)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr("abq.adapters.claude.subprocess.Popen", fake_popen)
+
+    session = ManagedClaude(["--model", "fable", "--effort", "xhigh"])
+    first = session.turn("one", timeout=1)
+    second = session.turn("two", timeout=1)
+    exit_code = session.close()
+
+    assert first["result"]["result"] == "reply:one"
+    assert second["result"]["result"] == "reply:two"
+    assert first["result"]["session_id"] == second["result"]["session_id"]
+    assert len(created) == 1
+    assert "--model" in created[0].command
+    assert exit_code == 0
+
+
+def test_managed_claude_rejects_overrides_of_wire_flags():
+    with pytest.raises(ValueError, match="controlled"):
+        ManagedClaude(["--output-format=json"])
+
+
+def test_managed_claude_preserves_partial_events_on_timeout(monkeypatch):
+    def fake_popen(command, **kwargs):
+        process = _FakeProcess(command)
+
+        def write_without_result(line):
+            frame = json.loads(line)
+            text = frame["message"]["content"][0]["text"]
+            process.stdout.lines.put(
+                json.dumps({"type": "assistant", "text": text}) + "\n"
+            )
+            return len(line)
+
+        process.stdin.write = write_without_result
+        return process
+
+    monkeypatch.setattr("abq.adapters.claude.subprocess.Popen", fake_popen)
+    session = ManagedClaude([])
+
+    with pytest.raises(ClaudeTurnError) as caught:
+        session.turn("partial", timeout=0.02)
+
+    assert caught.value.timed_out is True
+    assert caught.value.events == [{"type": "assistant", "text": "partial"}]
+    session.close()

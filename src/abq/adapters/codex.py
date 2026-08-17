@@ -11,7 +11,7 @@ after the fact. A session has to be started against a shared app-server:
     codex app-server --listen unix://~/.abq/codex.sock     # once
     codex --remote unix://~/.abq/codex.sock                # each session
 
-Verified against codex-cli 0.145.0-alpha.29. See COMPATIBILITY.md.
+Verified against codex-cli 0.145.0-alpha.29 and 0.147.0. See COMPATIBILITY.md.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import os
 import socket
 import time
 import uuid
+from collections import deque
 
 from ..paths import abq_home
 from ..registry import Agent
@@ -32,6 +33,34 @@ REQUEST_TIMEOUT_SEC = 20.0
 #: How long to stay connected after handing over a turn, answering whatever the
 #: server asks us. Leaving immediately can strand a turn that needs an answer.
 GRACE_SEC = 1.5
+# Notifications stay immediate because the socket wakes as soon as a frame
+# arrives.  Only the restartable `thread/read` fallback uses this interval; a
+# shorter value repeatedly downloads a growing turn while nothing changed.
+TURN_POLL_SEC = 5.0
+TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
+
+# Current v2 server requests have different response enums from the legacy
+# approval methods.  Keep the exact wire values here instead of treating every
+# method containing "approval" as interchangeable.
+DECLINE_RESPONSES = {
+    "item/commandExecution/requestApproval": {"decision": "decline"},
+    "item/fileChange/requestApproval": {"decision": "decline"},
+    "execCommandApproval": {"decision": "abort"},
+    "applyPatchApproval": {"decision": "abort"},
+}
+
+
+class ReceiveTimeout(Unreachable):
+    """No app-server frame arrived before a transport deadline."""
+
+
+class RpcFailure(Unreachable):
+    """The app-server returned a JSON-RPC error response."""
+
+    def __init__(self, method: str, error: dict) -> None:
+        self.method = method
+        self.error = error
+        super().__init__(f"{method} failed: {error.get('message', error)}")
 
 
 def endpoint() -> str:
@@ -52,6 +81,9 @@ class Connection:
     def __init__(self, address: str, timeout: float = REQUEST_TIMEOUT_SEC) -> None:
         self.address = address
         self._next_id = 0
+        self.notifications: deque[dict] = deque()
+        self._completed_turns: dict[tuple[str, str], dict] = {}
+        self.server_requests: list[dict] = []
         path = _unix_path(address)
         try:
             if path is not None:
@@ -105,21 +137,19 @@ class Connection:
             ):
                 if "error" in message:
                     error = message["error"]
-                    raise Unreachable(
-                        f"{method} failed: {error.get('message', error)}"
-                    )
+                    raise RpcFailure(method, error)
                 return message.get("result") or {}
             self._handle_inbound(message)
 
     def _receive(self, deadline: float) -> dict:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise Unreachable("timed out waiting for the Codex app-server")
+            raise ReceiveTimeout("timed out waiting for the Codex app-server")
         self._ws.settimeout(remaining)
         try:
             raw = self._ws.receive()
         except (socket.timeout, TimeoutError) as exc:
-            raise Unreachable("timed out waiting for the Codex app-server") from exc
+            raise ReceiveTimeout("timed out waiting for the Codex app-server") from exc
         except (OSError, WebSocketError) as exc:
             raise Unreachable(f"app-server connection lost: {exc}") from exc
         if raw is None:
@@ -130,19 +160,41 @@ class Connection:
             return {}
 
     def _handle_inbound(self, message: dict) -> None:
-        """Answer what the server asks us; ignore the rest.
+        """Queue notifications and fail closed on server requests.
 
         The server blocks the turn while a request of its own is outstanding,
         so silence here would stall the very message we just delivered.
         """
         method, request_id = message.get("method"), message.get("id")
-        if method is None or request_id is None:
-            return  # a notification — not our concern for delivery
+        if method is None:
+            return
+        if request_id is None:
+            self.notifications.append(message)
+            if method == "turn/completed":
+                params = message.get("params") or {}
+                turn = params.get("turn") or {}
+                thread_id, turn_id = params.get("threadId"), turn.get("id")
+                if thread_id and turn_id:
+                    self._completed_turns[(thread_id, turn_id)] = turn
+            return
+        self.server_requests.append(
+            {"method": method, "params": message.get("params") or {}}
+        )
         if method == "currentTime/read":
             result = {"currentTimeAt": int(time.time())}
+        elif method in DECLINE_RESPONSES:
+            # abq transports the request but has no authority to approve it.
+            result = DECLINE_RESPONSES[method]
+        elif method == "item/permissions/requestApproval":
+            # This method has no decline variant.  Granting an empty profile is
+            # the fail-closed response accepted by the current schema.
+            result = {"permissions": {}, "scope": "turn"}
         elif "approval" in method.lower():
-            # abq is a message courier, not the human: never approve on their behalf.
-            result = {"decision": "denied"}
+            # Experimental app-server versions may add approval request
+            # methods before ABQ's compatibility table is updated.  Returning
+            # a decline-shaped answer may fail the turn if the new schema uses
+            # another enum, but it can never grant authority implicitly.
+            result = {"decision": "decline"}
         else:
             self._send(
                 {
@@ -169,10 +221,117 @@ class Connection:
         return list(self.request("thread/loaded/list").get("data") or [])
 
     def start_turn(self, thread_id: str, text: str) -> dict:
-        return self.request(
-            "turn/start",
-            {"threadId": thread_id, "input": [{"type": "text", "text": text}]},
+        return self.start_turn_with_params(
+            thread_id, {"input": [{"type": "text", "text": text}]}
         )
+
+    def start_thread(self, params: dict) -> dict:
+        return self.request("thread/start", params)
+
+    def resume_thread(self, thread_id: str, params: dict | None = None) -> dict:
+        body = dict(params or {})
+        body["threadId"] = thread_id
+        return self.request("thread/resume", body)
+
+    def read_thread(self, thread_id: str, include_turns: bool = True) -> dict:
+        return self.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": include_turns}
+        )
+
+    def start_turn_with_params(self, thread_id: str, params: dict) -> dict:
+        body = dict(params)
+        supplied = body.get("threadId")
+        if supplied is not None and supplied != thread_id:
+            raise ValueError("turn params contain a different threadId")
+        body["threadId"] = thread_id
+        return self.request("turn/start", body)
+
+    def interrupt_turn(self, thread_id: str, turn_id: str) -> dict:
+        return self.request(
+            "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+        )
+
+    def delete_thread(self, thread_id: str) -> dict:
+        return self.request("thread/delete", {"threadId": thread_id})
+
+    def _completed_notification(self, thread_id: str, turn_id: str) -> dict | None:
+        matched = self._completed_turns.pop((thread_id, turn_id), None)
+        if matched is None:
+            return None
+        kept: deque[dict] = deque()
+        while self.notifications:
+            notification = self.notifications.popleft()
+            params = notification.get("params") or {}
+            turn = params.get("turn") or {}
+            if (
+                notification.get("method") == "turn/completed"
+                and params.get("threadId") == thread_id
+                and turn.get("id") == turn_id
+            ):
+                continue
+            else:
+                kept.append(notification)
+        self.notifications = kept
+        return matched
+
+    def _read_turn_if_terminal(self, thread_id: str, turn_id: str) -> dict | None:
+        response = self.read_thread(thread_id, include_turns=True)
+        for turn in (response.get("thread") or {}).get("turns") or []:
+            if turn.get("id") != turn_id:
+                continue
+            if turn.get("status") in TERMINAL_TURN_STATUSES:
+                return turn
+            return None
+        # `turn/start` can answer before the new turn is visible to
+        # `thread/read`; absence is therefore a transient state, not proof that
+        # the caller supplied a bad id.
+        return None
+
+    def wait_turn(self, thread_id: str, turn_id: str, timeout: float) -> dict:
+        """Wait for a terminal turn, preserving unrelated notifications.
+
+        Notifications give the lowest latency on the connection that started a
+        turn.  Periodic `thread/read` makes the wait restartable from a new ABQ
+        process after its previous tool call timed out.
+        """
+        if timeout < 0:
+            raise ValueError("turn timeout cannot be negative")
+        deadline = time.monotonic() + timeout
+        while True:
+            completed = self._completed_notification(thread_id, turn_id)
+            if completed is not None:
+                return completed
+
+            try:
+                terminal = self._read_turn_if_terminal(thread_id, turn_id)
+            except RpcFailure as exc:
+                # Ephemeral threads cannot be read on current Codex versions;
+                # their initiating connection still receives notifications.
+                if exc.method != "thread/read":
+                    raise
+                terminal = None
+            if terminal is not None:
+                return terminal
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Unreachable(
+                    f"timed out waiting for turn {turn_id!r} in thread {thread_id!r}"
+                )
+            receive_deadline = time.monotonic() + min(TURN_POLL_SEC, remaining)
+            try:
+                self._handle_inbound(self._receive(receive_deadline))
+            except ReceiveTimeout:
+                pass
+
+
+def agent_messages(turn: dict) -> list[str]:
+    """Extract complete agent-message items without assigning them semantics."""
+    return [
+        item.get("text", "")
+        for item in turn.get("items") or []
+        if item.get("type") == "agentMessage" and isinstance(item.get("text"), str)
+    ]
 
 
 class CodexAdapter:

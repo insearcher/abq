@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from .base import Adapter, Held, Unreachable
-from .claude import ClaudeAdapter
-from .codex import CodexAdapter
+from .claude import ClaudeAdapter, ManagedClaude
+from .codex import CodexAdapter, Connection
 
 ADAPTERS: dict[str, Adapter] = {
     ClaudeAdapter.name: ClaudeAdapter(),
@@ -33,7 +33,9 @@ __all__ = [
     "Adapter",
     "ClaudeAdapter",
     "CodexAdapter",
+    "Connection",
     "Held",
+    "ManagedClaude",
     "Unreachable",
     "detect_current_session",
 ]

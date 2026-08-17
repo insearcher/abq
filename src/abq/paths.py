@@ -21,6 +21,10 @@ def history_path() -> str:
     return os.path.join(abq_home(), "history.jsonl")
 
 
+def returns_path() -> str:
+    return os.path.join(abq_home(), "returns")
+
+
 def claude_home() -> str:
     return os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))
 

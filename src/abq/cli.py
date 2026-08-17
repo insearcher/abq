@@ -7,11 +7,14 @@ whatever shell tool they have. Humans mostly use `abq who` and `abq history`.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
-from . import history
+from . import history, returns
 from .adapters import ADAPTERS, Held, Unreachable, detect_current_session
+from .adapters.claude import ClaudeTurnError, ManagedClaude
+from .adapters.codex import Connection, agent_messages, endpoint as codex_endpoint
 from .registry import Agent, Registry
 
 BRIEF = """\
@@ -227,10 +230,231 @@ def cmd_brief(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_return_open(args: argparse.Namespace) -> int:
+    try:
+        print(returns.open_channel(ttl=args.ttl))
+    except returns.ReturnChannelError as exc:
+        print(f"abq return-open: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_return_send(args: argparse.Namespace) -> int:
+    try:
+        message_id = returns.send(args.token, args.text)
+    except returns.ReturnChannelError as exc:
+        print(f"abq return-send: {exc}", file=sys.stderr)
+        return 1
+    print(message_id)
+    return 0
+
+
+def cmd_return_wait(args: argparse.Namespace) -> int:
+    try:
+        record = returns.wait(args.token, timeout=args.timeout, poll=args.poll)
+    except returns.ReturnPending as exc:
+        print(f"abq return-wait: {exc}", file=sys.stderr)
+        return 3
+    except returns.ReturnChannelError as exc:
+        print(f"abq return-wait: {exc}", file=sys.stderr)
+        return 1
+    print(record["text"])
+    return 0
+
+
+def cmd_return_close(args: argparse.Namespace) -> int:
+    try:
+        returns.close(args.token)
+    except returns.ReturnChannelError as exc:
+        print(f"abq return-close: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _json_object(value: str, label: str) -> dict:
+    try:
+        if value == "-":
+            parsed = json.load(sys.stdin)
+        elif value.startswith("@"):
+            with open(value[1:], encoding="utf-8") as fh:
+                parsed = json.load(fh)
+        else:
+            parsed = json.loads(value)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return parsed
+
+
+def _text_input(value: str, label: str) -> str:
+    try:
+        if value == "-":
+            return sys.stdin.read()
+        if value.startswith("@"):
+            with open(value[1:], encoding="utf-8") as fh:
+                return fh.read()
+    except OSError as exc:
+        raise ValueError(f"invalid {label}: {exc}") from exc
+    return value
+
+
+def _print_json(value: dict) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def cmd_codex_start(args: argparse.Namespace) -> int:
+    try:
+        params = _json_object(args.params, "thread params")
+        with Connection(args.endpoint or codex_endpoint()) as connection:
+            response = connection.start_thread(params)
+    except (ValueError, Unreachable) as exc:
+        print(f"abq codex start: {exc}", file=sys.stderr)
+        return 1
+    _print_json(response)
+    return 0
+
+
+def cmd_codex_run(args: argparse.Namespace) -> int:
+    """Own one Codex thread connection from creation through terminal result."""
+    try:
+        thread_params = _json_object(args.thread_params, "thread params")
+        turn_params = _json_object(args.turn_params, "turn params")
+        with Connection(args.endpoint or codex_endpoint()) as connection:
+            started_thread = connection.start_thread(thread_params)
+            thread = started_thread.get("thread") or {}
+            thread_id = thread.get("id")
+            if not thread_id:
+                raise Unreachable("thread/start returned no thread id")
+            started_turn = connection.start_turn_with_params(thread_id, turn_params)
+            turn_id = (started_turn.get("turn") or {}).get("id")
+            if not turn_id:
+                raise Unreachable("turn/start returned no turn id")
+            terminal = connection.wait_turn(thread_id, turn_id, args.timeout)
+            output = _turn_result(connection, thread_id, terminal)
+            output["thread_start"] = started_thread
+            if args.delete_thread:
+                connection.delete_thread(thread_id)
+                output["thread_deleted"] = True
+    except (ValueError, Unreachable) as exc:
+        print(f"abq codex run: {exc}", file=sys.stderr)
+        return 1
+    _print_json(output)
+    return 0
+
+
+def _turn_result(connection: Connection, thread_id: str, turn: dict) -> dict:
+    return {
+        "thread_id": thread_id,
+        "turn": turn,
+        "agent_messages": agent_messages(turn),
+        "server_requests": connection.server_requests,
+    }
+
+
+def cmd_codex_turn(args: argparse.Namespace) -> int:
+    try:
+        params = _json_object(args.params, "turn params")
+        with Connection(args.endpoint or codex_endpoint()) as connection:
+            response = connection.start_turn_with_params(args.thread_id, params)
+            turn = response.get("turn") or {}
+            turn_id = turn.get("id")
+            if not turn_id:
+                raise Unreachable("turn/start returned no turn id")
+            if args.wait is None:
+                output = {
+                    "thread_id": args.thread_id,
+                    "turn": turn,
+                    "server_requests": connection.server_requests,
+                }
+            else:
+                terminal = connection.wait_turn(args.thread_id, turn_id, args.wait)
+                output = _turn_result(connection, args.thread_id, terminal)
+    except (ValueError, Unreachable) as exc:
+        print(f"abq codex turn: {exc}", file=sys.stderr)
+        return 1
+    _print_json(output)
+    return 0
+
+
+def cmd_codex_wait(args: argparse.Namespace) -> int:
+    try:
+        with Connection(args.endpoint or codex_endpoint()) as connection:
+            turn = connection.wait_turn(args.thread_id, args.turn_id, args.timeout)
+            output = _turn_result(connection, args.thread_id, turn)
+    except (ValueError, Unreachable) as exc:
+        print(f"abq codex wait: {exc}", file=sys.stderr)
+        return 1
+    _print_json(output)
+    return 0
+
+
+def cmd_codex_interrupt(args: argparse.Namespace) -> int:
+    try:
+        with Connection(args.endpoint or codex_endpoint()) as connection:
+            response = connection.interrupt_turn(args.thread_id, args.turn_id)
+    except Unreachable as exc:
+        print(f"abq codex interrupt: {exc}", file=sys.stderr)
+        return 1
+    _print_json(response)
+    return 0
+
+
+def cmd_codex_delete(args: argparse.Namespace) -> int:
+    try:
+        with Connection(args.endpoint or codex_endpoint()) as connection:
+            response = connection.delete_thread(args.thread_id)
+    except Unreachable as exc:
+        print(f"abq codex delete: {exc}", file=sys.stderr)
+        return 1
+    _print_json(response)
+    return 0
+
+
+def cmd_claude_run(args: argparse.Namespace) -> int:
+    provider_args = list(args.provider_args)
+    if provider_args[:1] == ["--"]:
+        provider_args.pop(0)
+    session = None
+    try:
+        text = _text_input(args.text, "Claude prompt")
+        session = ManagedClaude(provider_args, cwd=args.cwd)
+        output = session.turn(text, timeout=args.timeout)
+        exit_code = session.close()
+    except ClaudeTurnError as exc:
+        exit_code = session.close(timeout=0) if session is not None else None
+        _print_json(
+            {
+                "provider": "claude",
+                "status": "transport_error",
+                "error": str(exc),
+                "events": exc.events,
+                "stderr": exc.stderr_output,
+                "exit_code": exit_code,
+            }
+        )
+        print(f"abq claude run: {exc}", file=sys.stderr)
+        return 124 if exc.timed_out else 2
+    except (ValueError, Unreachable) as exc:
+        if session is not None:
+            session.close(timeout=0)
+        print(f"abq claude run: {exc}", file=sys.stderr)
+        return 2
+    envelope = {
+        "provider": "claude",
+        "result": output["result"],
+        "exit_code": exit_code,
+    }
+    if args.include_events:
+        envelope["events"] = output["events"]
+    _print_json(envelope)
+    return 1 if output["result"].get("is_error") else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="abq",
-        description="Messaging between running Claude Code and Codex sessions.",
+        description="Local transport between Claude Code and Codex.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -259,6 +483,95 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("brief", help="print usage instructions aimed at an agent")
     p.set_defaults(func=cmd_brief)
+
+    p = sub.add_parser("return-open", help="create a resumable one-shot return address")
+    p.add_argument("--ttl", type=float, default=returns.DEFAULT_TTL_SEC)
+    p.set_defaults(func=cmd_return_open)
+
+    p = sub.add_parser("return-send", help="publish one payload to a return address")
+    p.add_argument("token")
+    p.add_argument("text")
+    p.set_defaults(func=cmd_return_send)
+
+    p = sub.add_parser("return-wait", help="wait for or re-read a return payload")
+    p.add_argument("token")
+    p.add_argument("--timeout", type=float, required=True)
+    p.add_argument("--poll", type=float, default=returns.POLL_INTERVAL_SEC)
+    p.set_defaults(func=cmd_return_wait)
+
+    p = sub.add_parser("return-close", help="remove a return address and its payload")
+    p.add_argument("token")
+    p.set_defaults(func=cmd_return_close)
+
+    p = sub.add_parser("codex", help="provider-native Codex thread transport")
+    codex = p.add_subparsers(dest="codex_command", required=True)
+
+    def add_endpoint(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--endpoint", help="Codex app-server endpoint")
+
+    command = codex.add_parser("start", help="start a thread from caller JSON params")
+    command.add_argument("--params", required=True, help="JSON, @file, or - for stdin")
+    add_endpoint(command)
+    command.set_defaults(func=cmd_codex_start)
+
+    command = codex.add_parser(
+        "run", help="own a new thread through one turn and its terminal result"
+    )
+    command.add_argument(
+        "--thread-params", required=True, help="JSON, @file, or - for stdin"
+    )
+    command.add_argument(
+        "--turn-params", required=True, help="JSON or @file"
+    )
+    command.add_argument("--timeout", type=float, required=True)
+    command.add_argument(
+        "--delete-thread",
+        action="store_true",
+        help="delete the thread after a terminal result; never implied",
+    )
+    add_endpoint(command)
+    command.set_defaults(func=cmd_codex_run)
+
+    command = codex.add_parser("turn", help="start a turn and optionally wait for it")
+    command.add_argument("thread_id")
+    command.add_argument("--params", required=True, help="JSON, @file, or - for stdin")
+    command.add_argument(
+        "--wait", type=float, metavar="SECONDS", help="wait for the terminal turn"
+    )
+    add_endpoint(command)
+    command.set_defaults(func=cmd_codex_turn)
+
+    command = codex.add_parser("wait", help="resume waiting for a terminal turn")
+    command.add_argument("thread_id")
+    command.add_argument("turn_id")
+    command.add_argument("--timeout", type=float, required=True)
+    add_endpoint(command)
+    command.set_defaults(func=cmd_codex_wait)
+
+    command = codex.add_parser("interrupt", help="interrupt an active turn")
+    command.add_argument("thread_id")
+    command.add_argument("turn_id")
+    add_endpoint(command)
+    command.set_defaults(func=cmd_codex_interrupt)
+
+    command = codex.add_parser("delete", help="delete a caller-selected thread")
+    command.add_argument("thread_id")
+    add_endpoint(command)
+    command.set_defaults(func=cmd_codex_delete)
+
+    p = sub.add_parser("claude", help="provider-native Claude stream transport")
+    claude = p.add_subparsers(dest="claude_command", required=True)
+    command = claude.add_parser("run", help="start a stream, send one turn, wait for result")
+    command.add_argument("--timeout", type=float, required=True)
+    command.add_argument("--cwd")
+    command.add_argument("--include-events", action="store_true")
+    command.add_argument("text", help="prompt text, @file, or - for stdin")
+    command.add_argument(
+        "provider_args",
+        nargs=argparse.REMAINDER,
+        help="opaque Claude flags after --; ABQ does not choose provider policy",
+    )
+    command.set_defaults(func=cmd_claude_run)
 
     return parser
 
