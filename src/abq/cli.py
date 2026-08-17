@@ -214,7 +214,9 @@ def cmd_history(args: argparse.Namespace) -> int:
     print("\033[2m-- following, Ctrl-C to stop --\033[0m" if color else "-- following --")
     try:
         for record in history.follow():
-            print(history.format_line(record, color))
+            # Flush every line: piping `-f` into a file or another command would
+            # otherwise hold the output in a block buffer and stream nothing.
+            print(history.format_line(record, color), flush=True)
     except KeyboardInterrupt:
         pass
     return 0

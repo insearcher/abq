@@ -140,3 +140,23 @@ def test_compose_without_footer_is_just_the_message():
     )
 
     assert body == "[abq] message from 'a':\n\ntext"
+
+
+def test_follow_flushes_each_line(bus, monkeypatch, capsys):
+    """Piping `-f` must stream, not sit in a block buffer."""
+    flushes = []
+    real_print = cli.print if hasattr(cli, "print") else print
+
+    def spy(*args, **kwargs):
+        flushes.append(kwargs.get("flush", False))
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr("builtins.print", spy)
+    monkeypatch.setattr(
+        cli.history, "follow", lambda: iter([{"from": "a", "to": "b", "text": "hi"}])
+    )
+
+    cli.main(["history", "-n", "0", "-f"])
+
+    # The banner may be unflushed; the streamed record must not be.
+    assert flushes and flushes[-1] is True

@@ -1,3 +1,5 @@
+import time
+
 from abq import history
 
 
@@ -36,3 +38,58 @@ def test_unicode_survives_a_round_trip(tmp_path):
     history.append({"from": "a", "to": "b", "text": "привет 👋"}, path=path)
 
     assert history.read(path=path)[0]["text"] == "привет 👋"
+
+
+def test_follow_yields_records_as_they_arrive(tmp_path):
+    """The -f mode must pick up appends without restarting."""
+    import threading
+
+    path = str(tmp_path / "history.jsonl")
+    history.append({"from": "a", "to": "b", "text": "first"}, path=path)
+
+    seen = []
+    stop = threading.Event()
+
+    def consume():
+        for record in history.follow(path=path, poll=0.02):
+            seen.append(record["text"])
+            if stop.is_set() or len(seen) >= 2:
+                return
+
+    reader = threading.Thread(target=consume, daemon=True)
+    reader.start()
+    for text in ("second", "third"):
+        time.sleep(0.05)
+        history.append({"from": "a", "to": "b", "text": text}, path=path)
+    reader.join(timeout=5)
+    stop.set()
+
+    # "first" predates the follow, so only the later appends arrive.
+    assert seen[:2] == ["second", "third"]
+
+
+def test_follow_starts_from_the_end_of_an_absent_file(tmp_path):
+    import threading
+
+    path = str(tmp_path / "later.jsonl")
+    seen = []
+
+    def consume():
+        for record in history.follow(path=path, poll=0.02):
+            seen.append(record["text"])
+            return
+
+    reader = threading.Thread(target=consume, daemon=True)
+    reader.start()
+    time.sleep(0.05)
+    history.append({"from": "a", "to": "b", "text": "created now"}, path=path)
+    reader.join(timeout=5)
+
+    assert seen == ["created now"]
+
+
+def test_zero_limit_means_no_history(tmp_path):
+    path = str(tmp_path / "history.jsonl")
+    history.append({"from": "a", "to": "b", "text": "x"}, path=path)
+
+    assert history.read(limit=0, path=path) == []

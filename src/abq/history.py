@@ -32,7 +32,9 @@ def read(limit: int | None = None, path: str | None = None) -> list[dict]:
     except FileNotFoundError:
         return []
     if limit is not None:
-        lines = lines[-limit:]
+        # A limit of 0 means "no history", not "all of it" — plain [-0:] slices
+        # from the start and would print everything.
+        lines = lines[-limit:] if limit > 0 else []
     return [json.loads(line) for line in lines if line.strip()]
 
 
