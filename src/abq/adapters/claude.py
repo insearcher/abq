@@ -18,16 +18,19 @@ user to approve it in the receiving session, and the receiver sends back a
 `held` receipt. We surface that status rather than pretending the send
 succeeded.
 
-Verified against Claude Code 2.1.227 and 2.1.229. See COMPATIBILITY.md.
+Verified against Claude Code 2.1.227, 2.1.229, and 2.1.233. See
+COMPATIBILITY.md.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import threading
+import time
 import uuid
 
 from ..paths import claude_home
@@ -37,6 +40,41 @@ from .base import Held, Unreachable
 SOCKET_DIR_NAME = "cc-socks"
 RECEIPT_WAIT_SEC = 1.5
 CONNECT_TIMEOUT_SEC = 5.0
+MANAGED_WIRE_FLAGS = (
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--replay-user-messages",
+)
+MANAGED_RESERVED_FLAGS = {
+    "-p",
+    "--print",
+    "--input-format",
+    "--output-format",
+    "--verbose",
+    "--replay-user-messages",
+}
+STREAM_CLOSED = object()
+
+
+class ClaudeTurnError(Unreachable):
+    """A failed managed turn with the stream evidence received before failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        events: list[dict],
+        stderr: str,
+        timed_out: bool = False,
+    ) -> None:
+        self.events = list(events)
+        self.stderr_output = stderr
+        self.timed_out = timed_out
+        super().__init__(message)
 
 
 def _socket_base_dir() -> str:
@@ -235,3 +273,148 @@ class ClaudeAdapter:
             if status in {"denied", "expired"}:
                 raise Unreachable(f"receiver reported {status}")
         return msg_id
+
+
+class ManagedClaude:
+    """A caller-owned Claude stream-json process that accepts multiple turns.
+
+    ABQ supplies only the wire-format flags.  Model, effort, permissions,
+    system prompt, tools, fallback, and every other provider policy remain
+    opaque caller-provided arguments.
+    """
+
+    def __init__(
+        self,
+        provider_args: list[str],
+        *,
+        cwd: str | None = None,
+        executable: str = "claude",
+    ) -> None:
+        for arg in provider_args:
+            flag = arg.split("=", 1)[0]
+            if flag in MANAGED_RESERVED_FLAGS:
+                raise ValueError(f"{flag} is controlled by the ABQ stream transport")
+        self.command = [executable, *MANAGED_WIRE_FLAGS, *provider_args]
+        try:
+            self._process = subprocess.Popen(
+                self.command,
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise Unreachable(f"cannot start Claude Code: {exc}") from exc
+        self._stdout: queue.Queue[dict | Exception | object] = queue.Queue()
+        self._stderr: list[str] = []
+        self._turn_lock = threading.Lock()
+        self._closed = False
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def __enter__(self) -> "ManagedClaude":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    def _read_stdout(self) -> None:
+        assert self._process.stdout is not None
+        try:
+            for line in self._process.stdout:
+                if not line.strip():
+                    continue
+                try:
+                    self._stdout.put(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    self._stdout.put(exc)
+        finally:
+            self._stdout.put(STREAM_CLOSED)
+
+    def _read_stderr(self) -> None:
+        assert self._process.stderr is not None
+        for line in self._process.stderr:
+            # Enough context for a useful failure without allowing an unbounded
+            # long-running provider log to consume the parent process.
+            if sum(len(part) for part in self._stderr) < 1024 * 1024:
+                self._stderr.append(line)
+
+    def stderr(self) -> str:
+        return "".join(self._stderr)
+
+    def turn(self, text: str, timeout: float) -> dict:
+        if timeout < 0:
+            raise ValueError("Claude turn timeout cannot be negative")
+        if self._closed or self._process.poll() is not None:
+            raise Unreachable(
+                f"Claude stream is closed (exit {self._process.poll()}): {self.stderr()}"
+            )
+        message = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+            },
+            "parent_tool_use_id": None,
+            "session_id": "",
+        }
+        deadline = time.monotonic() + timeout
+        events: list[dict] = []
+
+        def fail(message: str, *, timed_out: bool = False) -> ClaudeTurnError:
+            return ClaudeTurnError(
+                message,
+                events=events,
+                stderr=self.stderr(),
+                timed_out=timed_out,
+            )
+
+        with self._turn_lock:
+            assert self._process.stdin is not None
+            try:
+                self._process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise fail(f"Claude stream rejected the turn: {exc}") from exc
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise fail("timed out waiting for Claude result", timed_out=True)
+                try:
+                    event = self._stdout.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise fail(
+                        "timed out waiting for Claude result", timed_out=True
+                    ) from exc
+                if event is STREAM_CLOSED:
+                    raise fail("Claude stream closed before a result")
+                if isinstance(event, Exception):
+                    raise fail(f"Claude emitted invalid stream-json: {event}")
+                events.append(event)
+                if event.get("type") == "result":
+                    return {"result": event, "events": events}
+
+    def close(self, timeout: float = 10.0) -> int:
+        if self._closed:
+            return self._process.poll() if self._process.poll() is not None else 0
+        self._closed = True
+        if self._process.stdin is not None:
+            try:
+                self._process.stdin.close()
+            except OSError:
+                pass
+        try:
+            return self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._process.terminate()
+            try:
+                return self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                return self._process.wait(timeout=2)

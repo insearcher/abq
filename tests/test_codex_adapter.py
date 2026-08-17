@@ -19,7 +19,12 @@ import time
 import pytest
 
 from abq.adapters.base import Unreachable
-from abq.adapters.codex import CodexAdapter, Connection
+from abq.adapters.codex import (
+    TURN_POLL_SEC,
+    CodexAdapter,
+    Connection,
+    agent_messages,
+)
 from abq.registry import Agent
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -243,7 +248,11 @@ def test_approval_requests_are_declined_not_ignored(server):
     connection = Connection(f"unix://{server.path}")
     try:
         connection._handle_inbound(
-            {"id": 7, "method": "execCommandApproval", "params": {}}
+            {
+                "id": 7,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "touch /root/nope"},
+            }
         )
     finally:
         connection.close()
@@ -252,7 +261,119 @@ def test_approval_requests_are_declined_not_ignored(server):
     answers = server.wait_for(
         lambda s: [r for r in s.requests if r.get("id") == 7 and "result" in r]
     )
-    assert answers and answers[0]["result"]["decision"] == "denied"
+    assert answers and answers[0]["result"]["decision"] == "decline"
+
+
+def test_unknown_approval_request_fails_closed(server):
+    connection = Connection(f"unix://{server.path}")
+    try:
+        connection._handle_inbound(
+            {
+                "id": 8,
+                "method": "item/mcpTool/requestApproval",
+                "params": {"tool": "future-surface"},
+            }
+        )
+    finally:
+        connection.close()
+
+    answers = server.wait_for(
+        lambda s: [r for r in s.requests if r.get("id") == 8 and "result" in r]
+    )
+    assert answers and answers[0]["result"] == {"decision": "decline"}
+
+
+def test_permissions_request_receives_no_permissions(server):
+    connection = Connection(f"unix://{server.path}")
+    try:
+        connection._handle_inbound(
+            {
+                "id": 9,
+                "method": "item/permissions/requestApproval",
+                "params": {"permissions": {"network": True}},
+            }
+        )
+    finally:
+        connection.close()
+
+    answers = server.wait_for(
+        lambda s: [r for r in s.requests if r.get("id") == 9 and "result" in r]
+    )
+    assert answers and answers[0]["result"] == {
+        "permissions": {},
+        "scope": "turn",
+    }
+
+
+def test_restartable_thread_reads_are_backed_off():
+    assert TURN_POLL_SEC >= 5.0
+
+
+def test_notifications_are_preserved_while_waiting_for_a_response(server):
+    connection = Connection(f"unix://{server.path}")
+    try:
+        connection._handle_inbound(
+            {"method": "item/started", "params": {"item": {"id": "item-1"}}}
+        )
+        assert list(connection.notifications) == [
+            {"method": "item/started", "params": {"item": {"id": "item-1"}}}
+        ]
+    finally:
+        connection.close()
+
+
+def test_wait_turn_can_resume_from_thread_read(server, monkeypatch):
+    connection = Connection(f"unix://{server.path}")
+    terminal = {
+        "id": "turn-1",
+        "status": "completed",
+        "items": [{"type": "agentMessage", "text": "done"}],
+    }
+    monkeypatch.setattr(
+        connection,
+        "read_thread",
+        lambda thread_id, include_turns=True: {"thread": {"turns": [terminal]}},
+    )
+    try:
+        assert connection.wait_turn("thread-1", "turn-1", timeout=0) == terminal
+    finally:
+        connection.close()
+
+
+def test_wait_turn_keeps_unrelated_notifications(server, monkeypatch):
+    connection = Connection(f"unix://{server.path}")
+    connection._handle_inbound(
+        {"method": "other/event", "params": {"threadId": "other"}}
+    )
+    connection._handle_inbound(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed"},
+            },
+        }
+    )
+    monkeypatch.setattr(connection, "read_thread", lambda *args, **kwargs: {})
+    try:
+        assert connection.wait_turn("thread-1", "turn-1", timeout=0)["status"] == "completed"
+        assert [message["method"] for message in connection.notifications] == [
+            "other/event"
+        ]
+    finally:
+        connection.close()
+
+
+def test_agent_messages_returns_raw_completed_message_texts():
+    turn = {
+        "items": [
+            {"type": "agentMessage", "text": "commentary", "phase": "commentary"},
+            {"type": "reasoning", "summary": []},
+            {"type": "agentMessage", "text": "final", "phase": "final"},
+        ]
+    }
+
+    assert agent_messages(turn) == ["commentary", "final"]
 
 
 def test_detect_self_uses_the_thread_id_codex_exports(monkeypatch):

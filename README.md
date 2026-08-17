@@ -1,9 +1,10 @@
-# abq — a message bus for the coding agents already running on your machine
+# abq — a local transport between Claude Code and Codex
 
 `abq` lets a **running Claude Code session** and a **running Codex session** talk
-to each other. You keep the terminals you already have open; either agent sends a
-message to the other by name, and it arrives on its own — no copy-paste, no
-polling, no shared workspace to move into.
+to each other. It also exposes narrow provider-native lifecycle and return
+primitives for skills that need to start an agent, wait, and collect a result.
+You keep the terminals you already have open; either agent sends a message to
+the other by name, and it arrives on its own — no terminal scraping.
 
 ```console
 $ abq who
@@ -62,12 +63,78 @@ Then any agent can reach any other:
 | `abq history -n 20 [-f]` | the shared transcript, optionally tailed |
 | `abq brief` | usage text aimed at an agent, not a human |
 | `abq leave <alias>` | drop an alias |
+| `abq return-open/send/wait/close` | one-shot, restartable return address |
+| `abq codex run/start/turn/wait/interrupt/delete` | raw Codex thread lifecycle |
+| `abq claude run` | caller-configured Claude stream, one CLI turn and result |
 
 Teaching an agent to use it takes nothing: every delivered message carries a
 short footer explaining how to reply. To make it permanent, add one line to your
 `CLAUDE.md` / `AGENTS.md`:
 
 > To reach the other sessions on this machine, use `abq` (see `abq brief`).
+
+## Transport, not workflow
+
+ABQ does not define reviewer roles, assemble prompts, select models or effort,
+choose permission policy, retry, fall back, or decide whether a result is good.
+Those decisions belong to the calling skill. An alias and a return token are
+transport addresses only.
+
+For an attached session, a skill can create a resumable return address, include
+that opaque token in its own prompt, and wait for a one-shot payload:
+
+```bash
+token="$(abq return-open --ttl 1800)"
+abq send TARGET_ALIAS "<skill-owned request; publish the result with abq return-send $token>" --no-hint
+abq return-wait "$token" --timeout 1800
+abq return-close "$token"
+```
+
+The pending address has the requested TTL. A payload published before that
+deadline gets a fresh retention window of the same length, so a late publisher
+cannot race expiry and a waiter killed by a tool timeout can repeat
+`return-wait`. Only the first publisher succeeds. The calling skill owns
+cleanup and the meaning of the payload.
+
+For Codex, the caller passes provider request objects unchanged. ABQ adds only
+the selected thread id and transports JSON-RPC:
+
+```bash
+abq codex run --thread-params @thread-start.json \
+  --turn-params @turn-start.json --timeout 1800
+abq codex start --params @thread-start.json
+abq codex turn THREAD_ID --params @turn-start.json --wait 1800
+abq codex wait THREAD_ID TURN_ID --timeout 1800
+```
+
+`codex run` keeps the owning connection open from `thread/start` through the
+terminal result, which is required when the provider may request approval. The
+split commands expose raw lifecycle and restartable reads, but creating a
+thread in one process and starting a turn in another does not transfer its
+approval channel. The caller explicitly decides when to interrupt or delete a
+thread; `--delete-thread` is opt-in. Lifecycle and approvals for a thread
+already attached to a TUI belong to the TUI.
+
+For Claude, all provider policy stays after `--`; ABQ supplies only the
+stream-json wire flags and returns the provider's raw result envelope:
+
+```bash
+abq claude run --timeout 1800 @prompt.md -- \
+  --model fable --effort xhigh --permission-mode dontAsk
+```
+
+The prompt position accepts literal text, `@file`, or `-` for stdin. Use a file
+or stdin for large or private prompts so their contents do not enter the
+process argument list. Exit `0` is a successful provider result, `1` is a
+provider `is_error` result, `2` is an input/start/stream transport failure, and
+`124` is the caller's total timeout. A mid-turn transport failure emits a JSON
+envelope containing the partial stream events and captured stderr before
+exiting non-zero.
+
+The Python `ManagedClaude` transport accepts multiple turns on the same live
+stream. The CLI command performs the common spawn → one turn → wait → result
+cycle and then closes it. Starting a managed stream does not register it in the
+ABQ alias bus; `join/send` address only explicitly joined sessions.
 
 ## Starting bridge-ready sessions
 
@@ -105,22 +172,25 @@ send from the terminal session — see the caveat in
 Everything lives in `~/.abq` (override with `ABQ_HOME`):
 
 - `registry.json` — alias → session address
-- `history.jsonl` — every message abq delivered
+- `history.jsonl` — messages delivered through `abq send`
+- `returns/` — expiring one-shot return payloads (directory mode `0700`)
 
-The transcript matters more than it looks: provider inboxes are ephemeral, so
-this file is the only lasting record of what the agents said to each other.
+Provider inboxes are ephemeral, so this transcript is the lasting record of
+bus delivery. Managed provider results and return payloads use their own
+result envelopes and spool instead.
 
 ## Security model
 
 `abq` is for one trusted user on one machine. Both transports are Unix sockets
 with `0600` permissions, which is exactly the authorisation: anyone who can write
-to them is already you. There is no network listener, no daemon, and no token to
-leak.
+to them is already you. There is no network listener, daemon, or long-lived
+network authentication token.
 
-Two deliberate limits:
+Deliberate limits:
 
-- abq never approves anything on your behalf. When the Codex app-server asks for
-  a permission decision, abq declines and leaves it to the human at the TUI.
+- abq never approves anything on your behalf. A caller-owned managed Codex
+  connection declines provider approval requests and reports them. In an
+  attached TUI thread, Codex routes the prompt to that TUI and the human decides.
 - abq does not weaken the receiving session's policy. If Claude Code is set to
   hold peer messages, abq reports the hold instead of trying to bypass it.
 
