@@ -14,6 +14,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -139,6 +140,20 @@ class FakeAppServer:
     def sent(self, method):
         return [r for r in self.requests if r.get("method") == method]
 
+    def wait_for(self, predicate, timeout=5.0):
+        """Wait for the server thread to record something.
+
+        The client hands a frame to the socket and moves on, so asserting
+        straight away races the server's reader thread.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = predicate(self)
+            if found:
+                return found
+            time.sleep(0.02)
+        return predicate(self)
+
     def close(self):
         self._server.close()
 
@@ -172,16 +187,18 @@ def test_handshake_sends_client_info_and_initialized(server):
     with Connection(f"unix://{server.path}"):
         pass
 
-    params = server.sent("initialize")[0]["params"]
+    params = server.wait_for(lambda s: s.sent("initialize"))[0]["params"]
     assert params["clientInfo"]["name"] == "abq"
     assert params["capabilities"]["experimentalApi"] is True
-    assert server.sent("initialized"), "the server expects the initialized notification"
+    assert server.wait_for(
+        lambda s: s.sent("initialized")
+    ), "the server expects the initialized notification"
 
 
 def test_deliver_starts_a_turn_with_the_text_as_user_input(server):
     msg_id = CodexAdapter().deliver(agent_for(server), "ping from api", sender="api")
 
-    params = server.sent("turn/start")[0]["params"]
+    params = server.wait_for(lambda s: s.sent("turn/start"))[0]["params"]
     assert params["threadId"] == "thread-1"
     assert params["input"] == [{"type": "text", "text": "ping from api"}]
     assert msg_id == "turn-99"
@@ -232,7 +249,9 @@ def test_approval_requests_are_declined_not_ignored(server):
         connection.close()
 
     # The fake server records what we send it, including our response frames.
-    answers = [r for r in server.requests if r.get("id") == 7 and "result" in r]
+    answers = server.wait_for(
+        lambda s: [r for r in s.requests if r.get("id") == 7 and "result" in r]
+    )
     assert answers and answers[0]["result"]["decision"] == "denied"
 
 
