@@ -1,0 +1,20 @@
+{
+  "name": "abq",
+  "version": "0.1.0",
+  "description": "Agent-facing workflows for the ABQ local transport between Claude Code and Codex.",
+  "author": {
+    "name": "insearcher",
+    "url": "https://github.com/insearcher"
+  },
+  "homepage": "https://github.com/insearcher/abq",
+  "repository": "https://github.com/insearcher/abq",
+  "license": "MIT",
+  "keywords": [
+    "abq",
+    "agent-transport",
+    "claude-code",
+    "codex",
+    "local-messaging"
+  ],
+  "skills": "./skills/"
+}
