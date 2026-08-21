@@ -15,6 +15,7 @@ import struct
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,7 @@ from abq.adapters.codex import (
     CodexAdapter,
     Connection,
     agent_messages,
+    endpoint,
 )
 from abq.registry import Agent
 
@@ -383,6 +385,56 @@ def test_detect_self_uses_the_thread_id_codex_exports(monkeypatch):
     detected = CodexAdapter().detect_self()
     assert detected["thread_id"] == "thread-abc"
     assert detected["endpoint"].startswith("unix://")
+
+
+def test_endpoint_explicit_override_wins(monkeypatch, sockdir):
+    home = Path(sockdir)
+    standard = home / ".codex" / "app-server-control"
+    standard.mkdir(parents=True)
+    standard_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    standard_socket.bind(str(standard / "app-server-control.sock"))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ABQ_CODEX_ENDPOINT", "ws://127.0.0.1:4321")
+    try:
+        assert endpoint() == "ws://127.0.0.1:4321"
+    finally:
+        standard_socket.close()
+
+
+def test_endpoint_prefers_standard_codex_app_server_socket(monkeypatch, sockdir):
+    home = Path(sockdir)
+    standard = home / ".codex" / "app-server-control"
+    standard.mkdir(parents=True)
+    standard_path = standard / "app-server-control.sock"
+    standard_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    standard_socket.bind(str(standard_path))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("ABQ_CODEX_ENDPOINT", raising=False)
+    try:
+        assert endpoint() == f"unix://{standard_path}"
+    finally:
+        standard_socket.close()
+
+
+def test_endpoint_ignores_non_socket_standard_path(monkeypatch, tmp_path):
+    standard = tmp_path / ".codex" / "app-server-control"
+    standard.mkdir(parents=True)
+    (standard / "app-server-control.sock").write_text(
+        "not a socket", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ABQ_HOME", str(tmp_path / "abq-home"))
+    monkeypatch.delenv("ABQ_CODEX_ENDPOINT", raising=False)
+
+    assert endpoint() == f"unix://{tmp_path / 'abq-home' / 'codex.sock'}"
+
+
+def test_endpoint_falls_back_to_legacy_abq_socket(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ABQ_HOME", str(tmp_path / "abq-home"))
+    monkeypatch.delenv("ABQ_CODEX_ENDPOINT", raising=False)
+
+    assert endpoint() == f"unix://{tmp_path / 'abq-home' / 'codex.sock'}"
 
 
 def test_detect_self_outside_codex(monkeypatch):

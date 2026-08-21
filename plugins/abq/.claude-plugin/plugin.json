@@ -1,6 +1,6 @@
 {
   "name": "abq",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent-facing workflows for the ABQ local transport between Claude Code and Codex.",
   "author": {
     "name": "insearcher",

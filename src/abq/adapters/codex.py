@@ -6,12 +6,16 @@ renders in an attached TUI exactly like something the human typed.
 
 The one structural constraint comes from Codex itself: a plain `codex` TUI runs
 its agent in-process and is invisible to any app-server, so it cannot be joined
-after the fact. A session has to be started against a shared app-server:
+after the fact. A session has to be started against a shared app-server. ABQ
+prefers Codex's standard local app-server socket when it exists, while retaining
+the original ABQ socket as a compatibility fallback. Lifecycle remains outside
+the transport; one provider-owned way to create the socket is:
 
-    codex app-server --listen unix://~/.abq/codex.sock     # once
-    codex --remote unix://~/.abq/codex.sock                # each session
+    codex app-server daemon bootstrap
+    codex --remote unix://~/.codex/app-server-control/app-server-control.sock
 
-Verified against codex-cli 0.145.0-alpha.29 and 0.147.0. See COMPATIBILITY.md.
+Verified against codex-cli 0.145.0-alpha.29 through 0.149.0. See
+COMPATIBILITY.md.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import time
 import uuid
 from collections import deque
@@ -64,9 +69,26 @@ class RpcFailure(Unreachable):
 
 
 def endpoint() -> str:
-    """Where the shared Codex app-server listens."""
+    """Resolve the shared Codex app-server without starting provider state.
+
+    An explicit caller override always wins. Otherwise prefer Codex's standard
+    local app-server socket when present, then retain ABQ's original socket as
+    the compatibility fallback.
+    """
     configured = os.environ.get("ABQ_CODEX_ENDPOINT")
-    return configured or f"unix://{os.path.join(abq_home(), 'codex.sock')}"
+    if configured:
+        return configured
+
+    standard_socket = os.path.expanduser(
+        "~/.codex/app-server-control/app-server-control.sock"
+    )
+    try:
+        if stat.S_ISSOCK(os.stat(standard_socket).st_mode):
+            return f"unix://{standard_socket}"
+    except OSError:
+        pass
+
+    return f"unix://{os.path.join(abq_home(), 'codex.sock')}"
 
 
 def _unix_path(address: str) -> str | None:
@@ -113,7 +135,7 @@ class Connection:
         self.request(
             "initialize",
             {
-                "clientInfo": {"name": CLIENT_NAME, "title": "abq bridge", "version": "0.1.0"},
+                "clientInfo": {"name": CLIENT_NAME, "title": "abq bridge", "version": "0.1.1"},
                 "capabilities": {"experimentalApi": True},
             },
         )
