@@ -8,7 +8,7 @@ check when something breaks.
 | Component | Verified against | Date |
 |---|---|---|
 | Claude Code | 2.1.227, 2.1.229 (macOS); 2.1.233 (Linux) | 2026-08-17 |
-| Codex CLI | 0.145.0-alpha.29 (macOS, npm install); 0.147.0 (Linux) | 2026-08-17 |
+| Codex CLI | 0.145.0-alpha.29 (macOS, npm install); 0.147.0, 0.149.0 (Linux) | 2026-08-21 |
 
 ## Claude Code
 
@@ -81,6 +81,12 @@ message becomes a real user turn with:
 `thread/loaded/list` gives the set of threads a given app-server can inject
 into. Inside a session, `$CODEX_THREAD_ID` names its own thread, which is what
 `abq join` records.
+
+Without an explicit `ABQ_CODEX_ENDPOINT`, ABQ first checks Codex's standard
+local socket at `~/.codex/app-server-control/app-server-control.sock` and uses
+it only when the path is a Unix socket. Otherwise it retains the legacy
+`~/.abq/codex.sock` endpoint. Discovery is deliberately read-only: process
+lifecycle remains the calling environment's responsibility.
 
 **Non-obvious details.**
 

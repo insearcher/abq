@@ -86,6 +86,10 @@ abq codex run \
   --timeout <seconds>
 ```
 
+ABQ resolves an explicit `ABQ_CODEX_ENDPOINT` first, then Codex's standard
+local App Server Unix socket when present, and finally the legacy ABQ socket. It
+does not bootstrap, configure, or stop the server lifecycle.
+
 Prefer files or stdin for large or private prompts. Do not weaken provider
 approval policy. Preserve the raw result envelope and exit status for the
 caller; do not turn provider errors into successful semantic results.

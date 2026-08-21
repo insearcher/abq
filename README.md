@@ -163,17 +163,21 @@ approve them — `abq send` reports that as `HELD`. To let peers through:
 claude --settings '{"crossSessionInbound":"accept"}'
 ```
 
-**Codex** only exposes sessions attached to a shared app-server. Start one, then
-launch sessions against it:
+**Codex** only exposes sessions attached to a shared app-server. One
+provider-owned way to expose the standard local socket is:
 
 ```bash
-codex app-server --listen unix://~/.abq/codex.sock     # once, in the background
-codex --remote unix://~/.abq/codex.sock                # each session
+codex app-server daemon bootstrap
+codex app-server daemon version
+codex --remote unix://~/.codex/app-server-control/app-server-control.sock
 ```
 
 A plain `codex` runs its agent in-process and cannot be joined afterwards — this
-is Codex's design, not a limitation abq can route around. Point abq at a
-different endpoint with `ABQ_CODEX_ENDPOINT`.
+is Codex's design, not a limitation abq can route around. Endpoint precedence is
+an explicit `ABQ_CODEX_ENDPOINT`, then the standard local App Server Unix socket
+when present, then the legacy `~/.abq/codex.sock` compatibility path. ABQ only
+discovers these sockets; it never starts or configures their lifecycle. Point
+ABQ at any other endpoint with `ABQ_CODEX_ENDPOINT`.
 
 You can still watch a bridged session in the Codex desktop app: threads live in
 `~/.codex`, shared by every app-server on the machine, so a thread started with
