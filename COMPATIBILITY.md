@@ -7,7 +7,7 @@ check when something breaks.
 
 | Component | Verified against | Date |
 |---|---|---|
-| Claude Code | 2.1.227, 2.1.229 (macOS); 2.1.233 (Linux) | 2026-08-17 |
+| Claude Code | 2.1.227, 2.1.229 (macOS); 2.1.233, 2.1.238 (Linux) | 2026-08-21 |
 | Codex CLI | 0.145.0-alpha.29 (macOS, npm install); 0.147.0, 0.149.0 (Linux) | 2026-08-21 |
 
 ## Claude Code
@@ -38,6 +38,20 @@ anything arriving this way:
 
 To let peer messages through without touching your settings file, start the
 session with `claude --settings '{"crossSessionInbound":"accept"}'`.
+
+**Attached-session canary.** Claude Code 2.1.238 and Codex CLI 0.149.0 were
+verified together with fresh interactive sessions. Codex delivered a request
+to the attached Claude session, Claude sent a direct reply back to the attached
+Codex session, and Claude independently published the requested return payload;
+all three deliveries completed with receipts and exact marker payloads. Claude
+was started with the per-session `crossSessionInbound=accept` setting, so no
+global user setting was required.
+
+When a Claude process is launched from inside Codex solely as a test harness,
+unset the inherited `CODEX_THREAD_ID` before calling `abq join`. Session-kind
+detection intentionally prefers that variable so a real Codex process nested
+under Claude is still classified as Codex. Independently started Codex and
+Claude sessions do not share this harness-only environment contamination.
 
 **Known dead end.** Writing to the Agent Teams mailbox
 (`~/.claude/teams/<team>/inboxes/<agent>.json`) worked on 2.1.201 but does
